@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NFL Confidence Picks</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>NFL Confidence Picks</h1>
+    <div class="controls">
+      <label>User: <input id="user" placeholder="Your name" /></label>
+      <label>Season: <input id="season" type="number" min="2000" /></label>
+      <label>Week: <input id="week" type="number" min="1" max="18" /></label>
+      <button id="load">Load Games</button>
+      <button id="save">Save Picks</button>
+      <button id="refreshResults">Refresh Results</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Games</h2>
+      <div id="games" class="games"></div>
+      <div class="hint" id="rangeHint"></div>
+    </section>
+
+    <section>
+      <h2>Scoreboard</h2>
+      <div id="scoreboard"></div>
+    </section>
+  </main>
+
+  <footer>
+    <small>Data from ESPN public scoreboard. For friends-only fun.</small>
+  </footer>
+
+  <script src="/script.js"></script>
+</body>
+</html>
