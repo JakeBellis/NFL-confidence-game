@@ -6,7 +6,6 @@ import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
 import { fileURLToPath } from 'url';
-import { db, upsertTeam, upsertGame, getGamesByWeek, upsertPick as upsertPickDB, getUserPicksByWeek, getAllPicksByWeek, upsertWeekFetch, getWeekFetch } from './db/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,7 +17,25 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Legacy JSON persistence removed in favor of SQLite
+// JSON persistence using db.json
+const DB_PATH = path.join(__dirname, 'db.json');
+
+function readDB() {
+  try {
+    const raw = fs.readFileSync(DB_PATH, 'utf-8');
+    const data = JSON.parse(raw);
+    // Ensure basic structure
+    return Object.assign({ users: [], picks: {}, results: {}, gamesCache: {} }, data);
+  } catch (e) {
+    const init = { users: [], picks: {}, results: {}, gamesCache: {} };
+    fs.writeFileSync(DB_PATH, JSON.stringify(init, null, 2));
+    return init;
+  }
+}
+
+function writeDB(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
 
 function getSeasonYear(date = new Date()) {
   // NFL regular season spans starting Sep week to Jan; use year of September if before March
@@ -81,9 +98,17 @@ app.get('/api/week-info', async (req, res) => {
   try {
     const season = getSeasonYear();
     const guessWeeks = Array.from({ length: 18 }, (_, i) => i + 1);
-    // Try to detect the current week by finding a scoreboard that has events close to now
-    // For simplicity, return season and let client choose week
-    res.json({ season, defaultWeek: null, weeks: guessWeeks });
+    let defaultWeek = null;
+    try {
+      // Ask ESPN for the current week's scoreboard for this season
+      const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&year=${season}`;
+      const { data } = await axios.get(url, { timeout: 20000 });
+      const wk = data?.week?.number;
+      if (Number.isInteger(wk) && wk >= 1 && wk <= 18) defaultWeek = wk;
+    } catch (_) {
+      // ignore and fall back to null
+    }
+    res.json({ season, defaultWeek, weeks: guessWeeks });
   } catch (e) {
     res.status(500).json({ error: 'Failed to get week info' });
   }
@@ -95,53 +120,24 @@ app.get('/api/games', async (req, res) => {
     const week = Number(req.query.week);
     if (!week) return res.status(400).json({ error: 'week is required' });
 
-    // Try DB first
-    let rows = getGamesByWeek.all(season, week);
-    if (!rows.length) {
+    const key = `${season}-${week}`;
+    const db = readDB();
+    let cache = db.gamesCache?.[key];
+    if (!cache || !Array.isArray(cache.games) || cache.games.length === 0) {
       const games = await fetchWeekGames({ season, week });
-      // Upsert teams and games into DB
-      for (const g of games) {
-        const mapTeam = (t) => ({
-          espn_id: t.id,
-          name: t.name,
-          abbreviation: t.abbreviation,
-          logo: t.logo || null,
-        });
-        upsertTeam.run(mapTeam(g.home));
-        upsertTeam.run(mapTeam(g.away));
-        const status = (g.status || '').toLowerCase().includes('final') ? 'post' : 'pre';
-        upsertGame.run({
-          event_id: g.id,
-          season,
-          week,
-          start_utc: g.date,
-          status,
-          home_team_id: g.home.id,
-          away_team_id: g.away.id,
-          home_score: g.home.score ?? 0,
-          away_score: g.away.score ?? 0,
-          winner_team_id: null
-        });
-      }
-      upsertWeekFetch.run({ season, week, last_schedule_fetch_utc: new Date().toISOString(), last_results_fetch_utc: null });
-      rows = getGamesByWeek.all(season, week);
+      db.gamesCache = db.gamesCache || {};
+      db.gamesCache[key] = { ts: Date.now(), games };
+      writeDB(db);
+      cache = db.gamesCache[key];
     }
-    // Map DB rows to existing client shape
-    const payload = rows.map(r => ({
-      id: r.event_id,
-      date: r.start_utc,
-      status: r.status === 'post' ? 'STATUS_FINAL' : 'STATUS_SCHEDULED',
-      home: { id: r.home_team_id, name: r.home_name, abbreviation: r.home_abbr, logo: r.home_logo, score: r.home_score },
-      away: { id: r.away_team_id, name: r.away_name, abbreviation: r.away_abbr, logo: r.away_logo, score: r.away_score },
-    }));
-    res.json(payload);
+    res.json(cache.games || []);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Failed to fetch games' });
   }
 });
 
-app.post('/api/picks', (req, res) => {
+app.post('/api/picks', async (req, res) => {
   try {
     const { user, season, week, picks } = req.body;
     if (!user || !season || !week || !Array.isArray(picks)) {
@@ -155,84 +151,91 @@ app.post('/api/picks', (req, res) => {
       return res.status(400).json({ error: 'Each confidence value must be unique' });
     }
 
-    // translate pick side -> team id using DB
-    const rows = getGamesByWeek.all(season, week);
-    const byId = new Map(rows.map(r => [r.event_id, r]));
-    db.transaction((ps) => {
-      for (const p of ps) {
-        const r = byId.get(p.gameId);
-        if (!r) continue;
-        const teamId = p.pick === 'home' ? r.home_team_id : r.away_team_id;
-        upsertPickDB.run({ user, season, week, event_id: p.gameId, picked_team_id: teamId, confidence: p.confidence });
-      }
-    })(picks);
+    const db = readDB();
+    const key = `${season}-${week}`;
+    if (!db.picks) db.picks = {};
+    if (!db.picks[key]) db.picks[key] = {};
+    db.picks[key][user] = picks;
+    writeDB(db);
     res.json({ ok: true });
   } catch (e) {
-    const msg = String(e);
-    if (msg.includes('uniq_picks_user_week_conf')) {
-      return res.status(400).json({ error: 'Each confidence value must be unique' });
-    }
     res.status(500).json({ error: 'Failed to save picks' });
   }
 });
 
-app.get('/api/picks', (req, res) => {
+app.get('/api/picks', async (req, res) => {
   const { user, season, week } = req.query;
   if (!user) return res.json([]);
-  const rows = getUserPicksByWeek.all(user, Number(season), Number(week));
-  // convert to old shape for UI
-  const games = getGamesByWeek.all(Number(season), Number(week));
-  const byId = new Map(games.map(r => [r.event_id, r]));
-  const payload = rows.map(r => {
-    const g = byId.get(r.event_id);
-    const pick = g && r.picked_team_id === g.home_team_id ? 'home' : 'away';
-    return { gameId: r.event_id, pick, confidence: r.confidence };
-  });
+  const db = readDB();
+  const key = `${season}-${week}`;
+  const payload = db.picks?.[key]?.[user] || [];
   res.json(payload);
 });
 
-app.get('/api/scoreboard', (req, res) => {
+app.get('/api/scoreboard', async (req, res) => {
   const { season, week } = req.query;
   if (!season || !week) return res.status(400).json({ error: 'season and week required' });
-  const s = Number(season), w = Number(week);
-  const picks = getAllPicksByWeek.all(s, w);
-  const rows = db.prepare(`SELECT event_id, winner_team_id FROM games WHERE season=? AND week=?`).all(s, w);
-  const winners = new Map(rows.map(r => [r.event_id, r.winner_team_id]));
+  const key = `${season}-${week}`;
+  const db = readDB();
+  const results = db.results?.[key] || {};
+  const weekPicks = db.picks?.[key] || {};
   const totals = {};
-  for (const p of picks) {
-    const winTeam = winners.get(p.event_id);
-    if (!winTeam) continue;
-    if (!totals[p.user]) totals[p.user] = 0;
-    if (winTeam === p.picked_team_id) totals[p.user] += p.confidence;
+  for (const [user, arr] of Object.entries(weekPicks)) {
+    totals[user] = 0;
+    for (const p of arr) {
+      if (results[p.gameId] && results[p.gameId] === p.pick) {
+        totals[user] += Number(p.confidence) || 0;
+      }
+    }
   }
-  res.json({ scores: totals, results: Object.fromEntries(winners) });
+  res.json({ scores: totals, results });
+});
+
+// Season-long cumulative scoreboard
+app.get('/api/scoreboard-season', async (req, res) => {
+  const { season } = req.query;
+  if (!season) return res.status(400).json({ error: 'season required' });
+  const s = String(season);
+  const db = readDB();
+  const totals = {};
+  for (const [key, users] of Object.entries(db.picks || {})) {
+    if (!key.startsWith(`${s}-`)) continue;
+    const weekResults = db.results?.[key] || {};
+    for (const [user, arr] of Object.entries(users)) {
+      if (!totals[user]) totals[user] = 0;
+      for (const p of arr) {
+        if (weekResults[p.gameId] && weekResults[p.gameId] === p.pick) {
+          totals[user] += Number(p.confidence) || 0;
+        }
+      }
+    }
+  }
+  res.json({ scores: totals });
 });
 
 async function updateResults(season, week) {
   try {
     const games = await fetchWeekGames({ season, week });
-    const results = {};
+    const db = readDB();
+    const key = `${season}-${week}`;
+    // Update cache with latest scores/statuses
+    db.gamesCache = db.gamesCache || {};
+    db.gamesCache[key] = { ts: Date.now(), games };
+
+    // Compute results for finals
+    db.results = db.results || {};
+    const weekResults = db.results[key] || {};
     for (const g of games) {
       const final = (g.status || '').toUpperCase().includes('FINAL');
-      const homeScore = Number(g.home.score ?? 0);
-      const awayScore = Number(g.away.score ?? 0);
-      const winnerTeamId = final ? (homeScore === awayScore ? null : (homeScore > awayScore ? g.home.id : g.away.id)) : null;
-      upsertGame.run({
-        event_id: g.id,
-        season,
-        week,
-        start_utc: g.date,
-        status: final ? 'post' : 'in',
-        home_team_id: g.home.id,
-        away_team_id: g.away.id,
-        home_score: homeScore,
-        away_score: awayScore,
-        winner_team_id: winnerTeamId
-      });
-      if (final && winnerTeamId) results[g.id] = winnerTeamId === g.home.id ? 'home' : 'away';
+      if (final) {
+        if (g.home.score == null || g.away.score == null) continue;
+        if (g.home.score === g.away.score) continue; // ignore ties
+        weekResults[g.id] = g.home.score > g.away.score ? 'home' : 'away';
+      }
     }
-    upsertWeekFetch.run({ season, week, last_schedule_fetch_utc: null, last_results_fetch_utc: new Date().toISOString() });
-    return results;
+    db.results[key] = weekResults;
+    writeDB(db);
+    return weekResults;
   } catch (e) {
     console.error('updateResults failed', e.message);
     return null;
@@ -248,7 +251,7 @@ app.post('/api/update-results', async (req, res) => {
 });
 
 // Cron: run every hour to update current season weeks 1..18
-cron.schedule('15 * * * *', async () => {
+cron.schedule('0 0 * * *', async () => {
   const season = getSeasonYear();
   for (let week = 1; week <= 18; week++) {
     await updateResults(season, week);

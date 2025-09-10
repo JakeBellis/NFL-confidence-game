@@ -22,7 +22,7 @@ Open http://localhost:3000
 
 ## Notes
 - Data source: ESPN public scoreboard API.
-- Results update via cron (15 past each hour) and via the "Refresh Results" button.
+- Results update via cron (midnight) and via the "Refresh Results" button.
 - Simple JSON file `db.json` is used for storage in this folder.
 
 ## Caveats

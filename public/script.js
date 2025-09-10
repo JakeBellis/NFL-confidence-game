@@ -6,15 +6,17 @@ const saveBtn = document.getElementById('save');
 const gamesEl = document.getElementById('games');
 const hintEl = document.getElementById('rangeHint');
 const scoreboardEl = document.getElementById('scoreboard');
+const seasonScoreboardEl = document.getElementById('seasonScoreboard');
 const refreshResultsBtn = document.getElementById('refreshResults');
 
 let games = [];
+let currentRange = [];
 
 function restorePrefs() {
   const prefs = JSON.parse(localStorage.getItem('prefs') || '{}');
   if (prefs.user) userEl.value = prefs.user;
   if (prefs.season) seasonEl.value = prefs.season;
-  if (prefs.week) weekEl.value = prefs.week;
+  if (prefs.week) weekEl.value = String(prefs.week);
 }
 function savePrefs() {
   localStorage.setItem('prefs', JSON.stringify({
@@ -28,6 +30,23 @@ async function fetchWeekInfo() {
   const res = await fetch('/api/week-info');
   const data = await res.json();
   if (!seasonEl.value) seasonEl.value = data.season;
+  // Populate week dropdown 1..18 and keep previous selection if any
+  if (weekEl && weekEl.tagName === 'SELECT') {
+    const prev = weekEl.value;
+    weekEl.innerHTML = '';
+    for (let i = 1; i <= 18; i++) {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = `Week ${i}`;
+      weekEl.appendChild(opt);
+    }
+    if (prev) weekEl.value = String(prev);
+    if (!weekEl.value) {
+      if (data.defaultWeek) weekEl.value = String(data.defaultWeek);
+      else weekEl.value = '1';
+    }
+  }
+  return data;
 }
 
 function confidenceRangeForCount(n) {
@@ -41,8 +60,8 @@ function confidenceRangeForCount(n) {
 
 function renderGames() {
   gamesEl.innerHTML = '';
-  const range = confidenceRangeForCount(games.length);
-  hintEl.textContent = `Allowed numbers: ${range.join(', ')} (use each at most once)`;
+  currentRange = confidenceRangeForCount(games.length);
+  hintEl.textContent = `Allowed numbers: ${currentRange.join(', ')} (use each at most once)`;
 
   if (!games.length) {
     const empty = document.createElement('div');
@@ -60,35 +79,29 @@ function renderGames() {
     const home = document.createElement('div');
     home.className = 'team home';
     home.innerHTML = `<img src="${g.home.logo}" alt="${g.home.abbreviation}"><div><div>${g.home.name}</div><div class="status">Home</div></div>`;
-    const homeInput = document.createElement('input');
-    homeInput.type = 'number';
-    homeInput.className = 'conf-input';
-    homeInput.placeholder = '—';
-    homeInput.min = String(Math.min(...range));
-    homeInput.max = String(Math.max(...range));
-    homeInput.dataset.side = 'home';
-    homeInput.addEventListener('input', onConfidenceChange);
+  const homeInput = document.createElement('select');
+  homeInput.className = 'conf-input';
+  homeInput.dataset.side = 'home';
+  homeInput.addEventListener('change', onConfidenceChange);
     // score badge near team logo
     const homeScore = document.createElement('span');
     homeScore.className = 'team-score';
-    home.appendChild(homeScore);
-    home.appendChild(homeInput);
+  home.appendChild(homeScore);
+  // place the confidence picker on the left side
+  home.prepend(homeInput);
     
     const away = document.createElement('div');
     away.className = 'team away';
     away.innerHTML = `<img src="${g.away.logo}" alt="${g.away.abbreviation}"><div><div>${g.away.name}</div><div class="status">Away</div></div>`;
-    const awayInput = document.createElement('input');
-    awayInput.type = 'number';
-    awayInput.className = 'conf-input';
-    awayInput.placeholder = '—';
-    awayInput.min = String(Math.min(...range));
-    awayInput.max = String(Math.max(...range));
-    awayInput.dataset.side = 'away';
-    awayInput.addEventListener('input', onConfidenceChange);
+  const awayInput = document.createElement('select');
+  awayInput.className = 'conf-input';
+  awayInput.dataset.side = 'away';
+  awayInput.addEventListener('change', onConfidenceChange);
     const awayScore = document.createElement('span');
     awayScore.className = 'team-score';
-    away.appendChild(awayScore);
-    away.appendChild(awayInput);
+  away.appendChild(awayScore);
+  // place the confidence picker on the left side
+  away.prepend(awayInput);
 
     const kickoff = document.createElement('div');
     kickoff.className = 'kickoff';
@@ -104,6 +117,8 @@ function renderGames() {
     errors.className = 'hint';
     hintEl.insertAdjacentElement('afterend', errors);
   }
+  // Populate dropdown options initially
+  updateAllDropdownOptions();
   updateValidationUI();
 }
 
@@ -111,10 +126,13 @@ function onConfidenceChange(e) {
   const input = e.target;
   const row = input.closest('.game');
   const others = Array.from(row.querySelectorAll('.conf-input')).filter(i => i !== input);
-  // If both sides filled, clear the other to avoid conflicts
-  for (const o of others) {
-    if (input.value && o.value) o.value = '';
+  // If selecting a value on one side, clear the other side to avoid conflicts
+  if (input.value) {
+    for (const o of others) {
+      if (o.value) o.value = '';
+    }
   }
+  updateAllDropdownOptions();
   updateValidationUI();
 }
 
@@ -132,7 +150,7 @@ function getPicksFromUI() {
 }
 
 function validatePicks(picks) {
-  const range = confidenceRangeForCount(games.length);
+  const range = currentRange.length ? currentRange : confidenceRangeForCount(games.length);
   const min = Math.min(...range), max = Math.max(...range);
   // per-game: not both sides
   for (const row of gamesEl.querySelectorAll('.game')) {
@@ -185,7 +203,7 @@ function updateValidationUI() {
   }
 
   // out-of-range
-  const range = confidenceRangeForCount(games.length);
+  const range = currentRange.length ? currentRange : confidenceRangeForCount(games.length);
   const min = Math.min(...range), max = Math.max(...range);
   for (const input of gamesEl.querySelectorAll('.conf-input')) {
     const v = input.value && Number(input.value);
@@ -236,6 +254,7 @@ async function loadExistingPicks() {
     if (pick.pick === 'home') inputs[0].value = String(pick.confidence);
     if (pick.pick === 'away') inputs[1].value = String(pick.confidence);
   }
+  updateAllDropdownOptions();
   updateValidationUI();
 }
 
@@ -263,6 +282,15 @@ async function savePicks() {
 async function refreshScoreboard() {
   const season = Number(seasonEl.value);
   const week = Number(weekEl.value);
+  // Season totals first (independent of week)
+  if (seasonScoreboardEl) {
+    try {
+      const sres = await fetch(`/api/scoreboard-season?season=${season}`);
+      const sdata = await sres.json();
+      const srows = Object.entries(sdata.scores || {}).sort((a,b) => b[1]-a[1]);
+      seasonScoreboardEl.innerHTML = srows.map(([user, score]) => `<div class="row"><div>${user}</div><div>${score}</div></div>`).join('') || '<div class="row">No season scores yet.</div>';
+    } catch {}
+  }
   if (!week) return;
   const res = await fetch(`/api/scoreboard?season=${season}&week=${week}`);
   const { scores, results } = await res.json();
@@ -274,8 +302,10 @@ async function refreshScoreboard() {
   for (const row of gamesEl.querySelectorAll('.game')) {
     const gameId = row.dataset.gameId;
     const g = games.find(x => x.id === gameId);
-  const hs = g.home.score != null ? g.home.score : '';
-  const as = g.away.score != null ? g.away.score : '';
+  // Only show scores once the game has started (not scheduled) or past kickoff
+  const hasStarted = (g.status && g.status.toUpperCase() !== 'STATUS_SCHEDULED') || (new Date(g.date).getTime() <= Date.now());
+  const hs = hasStarted && g.home.score != null ? g.home.score : '';
+  const as = hasStarted && g.away.score != null ? g.away.score : '';
   const winner = resMap[gameId];
   const homeTeamEl = row.querySelector('.team.home');
   const awayTeamEl = row.querySelector('.team.away');
@@ -283,6 +313,9 @@ async function refreshScoreboard() {
   const awayScoreEl = awayTeamEl.querySelector('.team-score');
   homeScoreEl.textContent = hs;
   awayScoreEl.textContent = as;
+  // Hide score bubbles until kickoff
+  homeScoreEl.style.display = hasStarted && hs !== '' ? '' : 'none';
+  awayScoreEl.style.display = hasStarted && as !== '' ? '' : 'none';
   homeTeamEl.classList.toggle('winner', winner === 'home');
   awayTeamEl.classList.toggle('winner', winner === 'away');
   }
@@ -306,5 +339,47 @@ refreshResultsBtn.addEventListener('click', refreshResults);
 
 (async function init() {
   restorePrefs();
-  await fetchWeekInfo();
+  const info = await fetchWeekInfo();
+  // Auto-load games when a new week is picked
+  if (weekEl) {
+    weekEl.addEventListener('change', () => {
+      if (weekEl.value) loadGames();
+    });
+  }
+  // Load current week immediately if available
+  if (info && info.defaultWeek) {
+    await loadGames();
+  }
 })();
+
+// Helpers to build and refresh dropdown options based on used numbers
+function buildOptions(select, usedSet) {
+  const current = select.value ? Number(select.value) : null;
+  const opts = [{ label: '—', value: '' }];
+  for (const v of currentRange) {
+    if (!usedSet.has(v) || v === current) {
+      opts.push({ label: String(v), value: String(v) });
+    }
+  }
+  const prev = Array.from(select.options).map(o => o.value).join(',');
+  const next = opts.map(o => o.value).join(',');
+  if (prev !== next) {
+    select.innerHTML = '';
+    for (const o of opts) {
+      const optEl = document.createElement('option');
+      optEl.value = o.value;
+      optEl.textContent = o.label;
+      select.appendChild(optEl);
+    }
+    // restore selection if still valid
+    select.value = current != null ? String(current) : '';
+  }
+}
+
+function updateAllDropdownOptions() {
+  const selects = Array.from(gamesEl.querySelectorAll('.conf-input'));
+  const used = new Set(
+    selects.map(s => (s.value ? Number(s.value) : null)).filter(v => v != null)
+  );
+  for (const s of selects) buildOptions(s, used);
+}
